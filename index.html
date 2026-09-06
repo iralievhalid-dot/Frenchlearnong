@@ -185,23 +185,45 @@
   .tooltip{
     position: fixed;
     z-index: 60;
-    max-width: 250px;
+    max-width: 280px;
     background: var(--accent-strong);
     color: #fff;
-    padding: 9px 10px 9px 13px;
-    border-radius: 10px;
+    padding: 10px 13px;
+    border-radius: 12px;
     box-shadow: 0 8px 20px rgba(30,68,65,0.35);
-    font-family: "Literata", serif;
-    font-size: 17px;
-    line-height: 1.3;
     display: flex;
-    align-items: center;
-    gap: 8px;
+    flex-direction: column;
+    gap: 6px;
     animation: tooltip-in .12s ease;
   }
   .tooltip.error{ background: var(--danger); }
-  .tooltip-text{ flex: 1; word-break: break-word; }
+
+  .tooltip-main{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .tooltip-text{
+    flex: 1;
+    font-family: "Literata", serif;
+    font-size: 17px;
+    line-height: 1.3;
+    word-break: break-word;
+  }
   .tooltip-text.loading{ opacity: .75; font-style: italic; }
+
+  .tooltip-context{
+    font-family: "IBM Plex Sans", sans-serif;
+    font-size: 12.5px;
+    line-height: 1.4;
+    opacity: .85;
+    padding-top: 6px;
+    border-top: 1px solid rgba(255,255,255,0.2);
+  }
+  .tooltip-context.loading{ opacity: .55; font-style: italic; }
+  .tooltip-context:empty{ display: none; padding: 0; border: none; }
+
   .tooltip-speak{
     background: rgba(255,255,255,0.2);
     border: none;
@@ -238,7 +260,7 @@
 <div class="app">
   <header>
     <h1>Français mot à mot</h1>
-    <p>Вставь французский текст. Нажми на слово — перевод появится прямо над ним, а озвучка прочитает слово по-французски.</p>
+    <p>Вставь французский текст. Нажми на слово — перевод появится прямо над ним вместе с переводом всей фразы для контекста, а озвучка прочитает слово по-французски.</p>
     <div class="voice-warning" id="voiceWarning">На этом устройстве не найден французский голос для озвучки. Слово всё равно будет прочитано, но произношение может быть неточным.</div>
   </header>
 
@@ -276,6 +298,9 @@
   let activeWordEl = null;
   let requestToken = 0;
 
+  const wordCache = new Map();
+  const sentenceCache = new Map();
+
   // ---- Voice setup: find a real French voice, don't let the browser guess ----
   let frenchVoice = null;
 
@@ -309,9 +334,14 @@
     window.speechSynthesis.speak(utter);
   }
 
-  // ---- Tokenizing + rendering ----
+  // ---- Tokenizing + rendering, with per-word sentence context stored ----
   function tokenize(text){
     return text.match(/[\p{L}\p{N}]+|[^\p{L}\p{N}]+/gu) || [];
+  }
+
+  function splitSentences(line){
+    const parts = line.match(/[^.!?…]+[.!?…]*/g);
+    return parts ? parts.map(s => s.trim()).filter(Boolean) : [line.trim()];
   }
 
   function renderText(text){
@@ -322,22 +352,27 @@
       const p = document.createElement('p');
       const lines = paragraph.split(/\n/);
       lines.forEach((line, li) => {
-        tokenize(line).forEach(tok => {
-          if (/[\p{L}\p{N}]/u.test(tok)) {
-            const span = document.createElement('span');
-            span.className = 'word';
-            span.textContent = tok;
-            span.dataset.word = tok.toLowerCase();
-            if (seenWords.has(tok.toLowerCase())) span.classList.add('seen');
-            span.addEventListener('click', (e) => {
-              e.stopPropagation();
-              openWord(tok, span);
+        if (line.trim()) {
+          splitSentences(line).forEach(sentence => {
+            tokenize(sentence).forEach(tok => {
+              if (/[\p{L}\p{N}]/u.test(tok)) {
+                const span = document.createElement('span');
+                span.className = 'word';
+                span.textContent = tok;
+                span.dataset.word = tok.toLowerCase();
+                span.dataset.sentence = sentence;
+                if (seenWords.has(tok.toLowerCase())) span.classList.add('seen');
+                span.addEventListener('click', (e) => {
+                  e.stopPropagation();
+                  openWord(tok, sentence, span);
+                });
+                p.appendChild(span);
+              } else {
+                p.appendChild(document.createTextNode(tok));
+              }
             });
-            p.appendChild(span);
-          } else {
-            p.appendChild(document.createTextNode(tok));
-          }
-        });
+          });
+        }
         if (li < lines.length - 1) p.appendChild(document.createElement('br'));
       });
       readerText.appendChild(p);
@@ -359,59 +394,83 @@
     composer.hidden = false;
   });
 
-  // ---- Translation: three free providers tried in order ----
+  // ---- Translation: real machine translation first, translation-memory lookup last ----
+  // (MyMemory is a translation-memory / fuzzy-match service, not true MT — great for
+  // full sentences, but for a single isolated word it can return unrelated matches
+  // from its corpus, e.g. a proper noun or a phrase from a totally different context.
+  // Google/Lingva run actual neural translation, so they go first.)
+
   function fetchWithTimeout(url, ms){
-    // Avoid AbortController here: some in-app / embedded mobile browsers
-    // (Telegram, Instagram, WhatsApp webviews, etc.) proxy fetch through a
-    // native bridge that cannot serialize an AbortSignal and throws
-    // "The object can not be cloned." Racing against a plain timer instead
-    // sidesteps that entirely.
     return Promise.race([
       fetch(url),
       new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms))
     ]);
   }
 
-  async function translateWithMyMemory(word){
-    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(word)}&langpair=${SL}|${TL}`;
-    const res = await fetchWithTimeout(url, 6000);
-    if (!res.ok) throw new Error('mymemory-http-' + res.status);
-    const data = await res.json();
-    const text = data && data.responseData && data.responseData.translatedText;
-    if (!text || /MYMEMORY WARNING|INVALID|MAX QUERY/i.test(text)) throw new Error('mymemory-empty');
-    return text;
+  // Reject results in an unexpected script (garbage matches sometimes come back
+  // in Arabic, CJK, etc. from translation-memory services) or empty/unchanged text.
+  function isPlausibleTranslation(text, original){
+    if (!text || !text.trim()) return false;
+    if (/[\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(text)) return false;
+    if (text.trim().toLowerCase() === original.trim().toLowerCase()) return false;
+    return true;
   }
 
-  async function translateWithGoogle(word){
-    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${SL}&tl=${TL}&dt=t&q=${encodeURIComponent(word)}`;
+  async function translateWithGoogle(text){
+    const url = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${SL}&tl=${TL}&dt=t&q=${encodeURIComponent(text)}`;
     const res = await fetchWithTimeout(url, 6000);
     if (!res.ok) throw new Error('google-http-' + res.status);
     const data = await res.json();
-    const text = data[0].map(part => part[0]).join('');
-    if (!text) throw new Error('google-empty');
-    return text;
+    const out = data[0].map(part => part[0]).join('');
+    if (!isPlausibleTranslation(out, text)) throw new Error('google-implausible');
+    return out;
   }
 
-  async function translateWithLingva(word){
-    const url = `https://lingva.ml/api/v1/${SL}/${TL}/${encodeURIComponent(word)}`;
+  async function translateWithLingva(text){
+    const url = `https://lingva.ml/api/v1/${SL}/${TL}/${encodeURIComponent(text)}`;
     const res = await fetchWithTimeout(url, 6000);
     if (!res.ok) throw new Error('lingva-http-' + res.status);
     const data = await res.json();
-    if (!data.translation) throw new Error('lingva-empty');
+    if (!isPlausibleTranslation(data.translation, text)) throw new Error('lingva-implausible');
     return data.translation;
   }
 
-  async function translateWord(word){
+  async function translateWithMyMemory(text){
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(text)}&langpair=${SL}|${TL}`;
+    const res = await fetchWithTimeout(url, 6000);
+    if (!res.ok) throw new Error('mymemory-http-' + res.status);
+    const data = await res.json();
+    const out = data && data.responseData && data.responseData.translatedText;
+    if (!out || /MYMEMORY WARNING|INVALID|MAX QUERY/i.test(out)) throw new Error('mymemory-empty');
+    if (!isPlausibleTranslation(out, text)) throw new Error('mymemory-implausible');
+    return out;
+  }
+
+  async function translateText(text){
     const errors = [];
-    for (const fn of [translateWithMyMemory, translateWithGoogle, translateWithLingva]) {
+    for (const fn of [translateWithGoogle, translateWithLingva, translateWithMyMemory]) {
       try {
-        return await fn(word);
+        return await fn(text);
       } catch (e) {
         errors.push(e.message || String(e));
       }
     }
-    const err = new Error('all-providers-failed: ' + errors.join(' | '));
-    throw err;
+    throw new Error('all-providers-failed: ' + errors.join(' | '));
+  }
+
+  async function translateWordCached(word){
+    const key = word.toLowerCase();
+    if (wordCache.has(key)) return wordCache.get(key);
+    const result = await translateText(word);
+    wordCache.set(key, result);
+    return result;
+  }
+
+  async function translateSentenceCached(sentence){
+    if (sentenceCache.has(sentence)) return sentenceCache.get(sentence);
+    const result = await translateText(sentence);
+    sentenceCache.set(sentence, result);
+    return result;
   }
 
   function markSeen(word){
@@ -449,7 +508,7 @@
     arrow.style.left = arrowLeft + 'px';
   }
 
-  async function openWord(word, wordEl){
+  async function openWord(word, sentence, wordEl){
     if (activeWordEl === wordEl) { hideTooltip(); return; }
     hideTooltip();
 
@@ -463,8 +522,11 @@
     tooltip.className = 'tooltip';
     tooltip.innerHTML =
       '<div class="tooltip-arrow"></div>' +
-      '<span class="tooltip-text loading">…</span>' +
-      '<button class="tooltip-speak" aria-label="Прослушать">' + speakerSvg() + '</button>';
+      '<div class="tooltip-main">' +
+        '<span class="tooltip-text loading">…</span>' +
+        '<button class="tooltip-speak" aria-label="Прослушать">' + speakerSvg() + '</button>' +
+      '</div>' +
+      '<div class="tooltip-context loading"></div>';
     document.body.appendChild(tooltip);
     activeTooltip = tooltip;
     positionTooltip(tooltip, wordEl);
@@ -476,22 +538,43 @@
 
     speak(word);
 
-    try {
-      const translation = await translateWord(word);
+    const textEl = tooltip.querySelector('.tooltip-text');
+    const contextEl = tooltip.querySelector('.tooltip-context');
+
+    // Word gloss
+    translateWordCached(word).then(translation => {
       if (myToken !== requestToken) return;
-      const textEl = tooltip.querySelector('.tooltip-text');
       textEl.textContent = translation;
       textEl.classList.remove('loading');
       positionTooltip(tooltip, wordEl);
       markSeen(word);
-    } catch (err) {
+    }).catch(err => {
       if (myToken !== requestToken) return;
-      const textEl = tooltip.querySelector('.tooltip-text');
-      textEl.textContent = 'Нет перевода (сеть?)';
+      textEl.textContent = 'Нет перевода';
       textEl.classList.remove('loading');
       tooltip.classList.add('error');
       positionTooltip(tooltip, wordEl);
-      console.error('Translation failed for "' + word + '":', err.message || err);
+      console.error('Word translation failed for "' + word + '":', err.message || err);
+    });
+
+    // Full-sentence context translation (only worth showing for actual sentences,
+    // not when the "sentence" is basically just the word itself)
+    const sentenceWordCount = (sentence.match(/[\p{L}\p{N}]+/gu) || []).length;
+    if (sentenceWordCount > 1) {
+      translateSentenceCached(sentence).then(translation => {
+        if (myToken !== requestToken) return;
+        contextEl.textContent = translation;
+        contextEl.classList.remove('loading');
+        positionTooltip(tooltip, wordEl);
+      }).catch(err => {
+        if (myToken !== requestToken) return;
+        contextEl.textContent = '';
+        contextEl.classList.remove('loading');
+        positionTooltip(tooltip, wordEl);
+        console.error('Sentence translation failed:', err.message || err);
+      });
+    } else {
+      contextEl.remove();
     }
   }
 
